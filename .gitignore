@@ -1,0 +1,16 @@
+backend/ips_client_secret.json
+backend/youtube_token.json
+backend/youtube_oauth_state.json
+.venv/
+__pycache__/
+backend/.env
+backend/.env
+backend/meta_token.json
+backend/meta_oauth_state.json
+backend/ips_drive_client_secret.json
+backend/drive_token.json
+backend/drive_oauth_state.json
+
+backend/youtube_token_backup.json
+test.mp4
+backend/social_publisher.db
