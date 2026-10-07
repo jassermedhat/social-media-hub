@@ -1,5 +1,6 @@
 from integrations.facebook import FacebookPublisher
 from integrations.instagram import InstagramPublisher
+from integrations.linkedin import LinkedInPublisher
 from integrations.youtube import YouTubePublisher
 from services.google_drive_media import MediaAsset
 
@@ -13,6 +14,7 @@ class PublishingService:
         privacy: str = "private",
         instagram_publish: bool = False,
         facebook_publish: bool = False,
+        linkedin_publish: bool = False,
         media_asset: MediaAsset | None = None,
     ):
         platform = platform.lower()
@@ -49,6 +51,17 @@ class PublishingService:
                 privacy=privacy,
                 publish=facebook_publish,
                 media_asset=media_asset,
+            )
+
+        if platform == "linkedin":
+            publisher = LinkedInPublisher()
+
+            return publisher.publish(
+                video_path=video_path,
+                title=title,
+                description=description,
+                privacy=privacy,
+                publish=linkedin_publish,
             )
 
         raise ValueError(

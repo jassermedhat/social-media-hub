@@ -748,3 +748,441 @@ def meta_status():
         ),
     }
 
+
+# ---------------------------------------------------------------------------
+# LinkedIn
+# ---------------------------------------------------------------------------
+
+LINKEDIN_TOKEN_FILE = BASE_DIR / "linkedin_token.json"
+LINKEDIN_OAUTH_STATE_FILE = BASE_DIR / "linkedin_oauth_state.json"
+
+LINKEDIN_AUTHORIZATION_URL = "https://www.linkedin.com/oauth/v2/authorization"
+LINKEDIN_PKCE_AUTHORIZATION_URL = (
+    "https://www.linkedin.com/oauth/native-pkce/authorization"
+)
+LINKEDIN_ACCESS_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
+
+
+def _linkedin_settings():
+    scopes = [
+        scope.strip()
+        for scope in os.getenv(
+            "LINKEDIN_SCOPES",
+            "w_organization_social",
+        ).replace(",", " ").split()
+        if scope.strip()
+    ]
+
+    settings = {
+        "client_id": os.getenv("LINKEDIN_CLIENT_ID"),
+        "client_secret": os.getenv("LINKEDIN_CLIENT_SECRET"),
+        "redirect_uri": os.getenv("LINKEDIN_REDIRECT_URI"),
+        "oauth_mode": os.getenv(
+            "LINKEDIN_OAUTH_MODE",
+            "standard",
+        ).strip().lower(),
+        "scopes": scopes,
+        "organization_id": os.getenv(
+            "LINKEDIN_ORGANIZATION_ID",
+            "",
+        ).strip(),
+        "organization_name": os.getenv(
+            "LINKEDIN_ORGANIZATION_NAME",
+            "IPS Automation",
+        ).strip(),
+        "api_version": os.getenv(
+            "LINKEDIN_API_VERSION",
+            "202609",
+        ).strip(),
+    }
+
+    if settings["oauth_mode"] not in {"standard", "pkce"}:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "LINKEDIN_OAUTH_MODE must be either 'standard' or 'pkce'."
+            ),
+        )
+
+    missing = [
+        key
+        for key in ("client_id", "redirect_uri")
+        if not settings[key]
+    ]
+
+    if (
+        settings["oauth_mode"] == "standard"
+        and not settings["client_secret"]
+    ):
+        missing.append("client_secret")
+
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Missing LinkedIn configuration: "
+                + ", ".join(missing)
+                + ". Check backend/.env and restart FastAPI."
+            ),
+        )
+
+    if not settings["scopes"]:
+        raise HTTPException(
+            status_code=500,
+            detail="LINKEDIN_SCOPES cannot be empty.",
+        )
+
+    redirect_uri = settings["redirect_uri"]
+
+    if (
+        settings["oauth_mode"] == "standard"
+        and not redirect_uri.startswith("https://")
+    ):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Standard LinkedIn OAuth requires an HTTPS "
+                "LINKEDIN_REDIRECT_URI."
+            ),
+        )
+
+    if settings["oauth_mode"] == "pkce":
+        is_ipv4_loopback = redirect_uri.startswith(
+            "http://127.0.0.1:"
+        ) or redirect_uri.startswith(
+            "https://127.0.0.1:"
+        )
+        is_ipv6_loopback = redirect_uri.startswith(
+            "http://[::1]:"
+        ) or redirect_uri.startswith(
+            "https://[::1]:"
+        )
+
+        if not (is_ipv4_loopback or is_ipv6_loopback):
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "LinkedIn PKCE native OAuth requires a loopback "
+                    "LINKEDIN_REDIRECT_URI such as "
+                    "http://127.0.0.1:8000/accounts/linkedin/callback."
+                ),
+            )
+
+    return settings
+
+
+def _linkedin_token_response_or_error(
+    response: requests.Response,
+    context: str,
+):
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+
+    if response.ok and isinstance(data, dict):
+        return data
+
+    detail = None
+
+    if isinstance(data, dict):
+        detail = (
+            data.get("error_description")
+            or data.get("message")
+            or data.get("error")
+        )
+
+    if not detail:
+        detail = response.text[:500] or f"HTTP {response.status_code}"
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"{context}: {detail}",
+    )
+
+
+def _linkedin_pkce_values():
+    import base64
+    import hashlib
+
+    code_verifier = secrets.token_urlsafe(64)
+    digest = hashlib.sha256(
+        code_verifier.encode("ascii")
+    ).digest()
+    code_challenge = base64.urlsafe_b64encode(
+        digest
+    ).decode("ascii").rstrip("=")
+
+    return code_verifier, code_challenge
+
+
+@router.get("/linkedin/connect")
+def connect_linkedin():
+    settings = _linkedin_settings()
+
+    state = secrets.token_urlsafe(32)
+    oauth_data = {
+        "state": state,
+        "oauth_mode": settings["oauth_mode"],
+    }
+
+    query = {
+        "response_type": "code",
+        "client_id": settings["client_id"],
+        "redirect_uri": settings["redirect_uri"],
+        "state": state,
+        "scope": " ".join(settings["scopes"]),
+    }
+
+    if settings["oauth_mode"] == "pkce":
+        code_verifier, code_challenge = _linkedin_pkce_values()
+        oauth_data["code_verifier"] = code_verifier
+        query["code_challenge"] = code_challenge
+        query["code_challenge_method"] = "S256"
+        authorization_base = LINKEDIN_PKCE_AUTHORIZATION_URL
+    else:
+        authorization_base = LINKEDIN_AUTHORIZATION_URL
+
+    LINKEDIN_OAUTH_STATE_FILE.write_text(
+        json.dumps(oauth_data),
+        encoding="utf-8",
+    )
+
+    authorization_url = (
+        f"{authorization_base}?{urlencode(query)}"
+    )
+
+    return RedirectResponse(authorization_url)
+
+
+@router.get("/linkedin/callback")
+def linkedin_callback(request: Request):
+    settings = _linkedin_settings()
+
+    oauth_error = request.query_params.get("error")
+    oauth_error_description = request.query_params.get(
+        "error_description"
+    )
+
+    if oauth_error:
+        LINKEDIN_OAUTH_STATE_FILE.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "LinkedIn authorization failed: "
+                + (oauth_error_description or oauth_error)
+            ),
+        )
+
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+
+    if not code:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing LinkedIn authorization code.",
+        )
+
+    if not state:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing LinkedIn OAuth state.",
+        )
+
+    if not LINKEDIN_OAUTH_STATE_FILE.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "LinkedIn OAuth session not found. "
+                "Start connection again."
+            ),
+        )
+
+    oauth_data = json.loads(
+        LINKEDIN_OAUTH_STATE_FILE.read_text(
+            encoding="utf-8",
+        )
+    )
+
+    if state != oauth_data.get("state"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid LinkedIn OAuth state.",
+        )
+
+    oauth_mode = oauth_data.get(
+        "oauth_mode",
+        settings["oauth_mode"],
+    )
+
+    token_payload = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": settings["redirect_uri"],
+        "client_id": settings["client_id"],
+    }
+
+    if oauth_mode == "pkce":
+        code_verifier = oauth_data.get("code_verifier")
+
+        if not code_verifier:
+            raise HTTPException(
+                status_code=400,
+                detail="LinkedIn PKCE code verifier is missing.",
+            )
+
+        token_payload["code_verifier"] = code_verifier
+
+    else:
+        token_payload["client_secret"] = settings["client_secret"]
+
+    response = requests.post(
+        LINKEDIN_ACCESS_TOKEN_URL,
+        data=token_payload,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        timeout=30,
+    )
+
+    token_data = _linkedin_token_response_or_error(
+        response,
+        "LinkedIn authorization-code exchange failed",
+    )
+
+    access_token = token_data.get("access_token")
+
+    if not access_token:
+        raise HTTPException(
+            status_code=400,
+            detail="LinkedIn did not return an access token.",
+        )
+
+    import time
+
+    retrieved_at = int(time.time())
+    expires_in = token_data.get("expires_in")
+
+    stored_token = dict(token_data)
+    stored_token["retrieved_at"] = retrieved_at
+    stored_token["oauth_mode"] = oauth_mode
+
+    if expires_in is not None:
+        try:
+            stored_token["expires_at"] = (
+                retrieved_at + int(expires_in)
+            )
+        except (TypeError, ValueError):
+            pass
+
+    LINKEDIN_TOKEN_FILE.write_text(
+        json.dumps(stored_token, indent=2),
+        encoding="utf-8",
+    )
+
+    organization_id = settings["organization_id"]
+    organization_name = (
+        settings["organization_name"]
+        or organization_id
+    )
+
+    if organization_id:
+        upsert_connected_account(
+            platform="linkedin",
+            account_id=organization_id,
+            account_name=organization_name,
+            token_file=LINKEDIN_TOKEN_FILE.name,
+        )
+
+    LINKEDIN_OAUTH_STATE_FILE.unlink(missing_ok=True)
+
+    return {
+        "success": True,
+        "platform": "linkedin",
+        "oauth_connected": True,
+        "configured": bool(organization_id),
+        "connected": bool(organization_id),
+        "organization_id": organization_id or None,
+        "organization_name": (
+            organization_name
+            if organization_id
+            else None
+        ),
+        "message": (
+            "LinkedIn connected successfully."
+            if organization_id
+            else (
+                "LinkedIn OAuth succeeded, but "
+                "LINKEDIN_ORGANIZATION_ID is not configured yet."
+            )
+        ),
+    }
+
+
+@router.get("/linkedin/status")
+def linkedin_status():
+    account = get_connected_account("linkedin")
+    settings = {
+        "organization_id": os.getenv(
+            "LINKEDIN_ORGANIZATION_ID",
+            "",
+        ).strip(),
+        "organization_name": os.getenv(
+            "LINKEDIN_ORGANIZATION_NAME",
+            "IPS Automation",
+        ).strip(),
+    }
+
+    token_exists = LINKEDIN_TOKEN_FILE.exists()
+    token_expired = False
+
+    if token_exists:
+        try:
+            token_data = json.loads(
+                LINKEDIN_TOKEN_FILE.read_text(
+                    encoding="utf-8",
+                )
+            )
+            expires_at = token_data.get("expires_at")
+
+            if expires_at is not None:
+                import time
+                token_expired = time.time() >= float(expires_at)
+
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            token_expired = True
+
+    organization_id = (
+        account["account_id"]
+        if account
+        else settings["organization_id"]
+    )
+
+    organization_name = (
+        account["account_name"]
+        if account
+        else settings["organization_name"]
+    )
+
+    return {
+        "platform": "linkedin",
+        "oauth_connected": token_exists and not token_expired,
+        "configured": bool(organization_id),
+        "connected": (
+            token_exists
+            and not token_expired
+            and bool(organization_id)
+        ),
+        "organization_id": organization_id or None,
+        "organization_name": (
+            organization_name
+            if organization_id
+            else None
+        ),
+        "connected_at": (
+            account["connected_at"]
+            if account
+            else None
+        ),
+        "token_expired": token_expired,
+    }

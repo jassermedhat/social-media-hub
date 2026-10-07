@@ -28,9 +28,10 @@ class PublishPostRequest(BaseModel):
         "public",
     ] = "private"
 
-    # Safety defaults: Meta platforms do not publish unless explicitly enabled.
+    # Safety defaults: external platforms do not publish unless explicitly enabled.
     instagram_publish: bool = False
     facebook_publish: bool = False
+    linkedin_publish: bool = False
 
 
 @router.post("/publish")
@@ -90,6 +91,7 @@ def publish_post(data: PublishPostRequest):
                 privacy=data.youtube_privacy,
                 instagram_publish=data.instagram_publish,
                 facebook_publish=data.facebook_publish,
+                linkedin_publish=data.linkedin_publish,
                 media_asset=media_asset,
             )
 
