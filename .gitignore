@@ -14,3 +14,7 @@ test.mp4
 backend/social_publisher.db
 backend/linkedin_token.json
 backend/linkedin_oauth_state.json
+backend/tiktok_credentials.bin
+backend/tiktok_oauth_state.bin
+backend/.tiktok_credentials.bin.*.tmp
+backend/.tiktok_oauth_state.bin.*.tmp

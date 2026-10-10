@@ -1,6 +1,7 @@
 from integrations.facebook import FacebookPublisher
 from integrations.instagram import InstagramPublisher
 from integrations.linkedin import LinkedInPublisher
+from integrations.tiktok import TikTokPublisher
 from integrations.youtube import YouTubePublisher
 from services.google_drive_media import MediaAsset
 
@@ -16,6 +17,7 @@ class PublishingService:
         facebook_publish: bool = False,
         linkedin_publish: bool = False,
         media_asset: MediaAsset | None = None,
+        tiktok_publish: bool = False,
     ):
         platform = platform.lower()
 
@@ -62,6 +64,17 @@ class PublishingService:
                 description=description,
                 privacy=privacy,
                 publish=linkedin_publish,
+            )
+
+        if platform == "tiktok":
+            publisher = TikTokPublisher()
+
+            return publisher.publish(
+                video_path=video_path,
+                title=title,
+                description=description,
+                privacy=privacy,
+                publish=tiktok_publish,
             )
 
         raise ValueError(

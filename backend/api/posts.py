@@ -32,6 +32,7 @@ class PublishPostRequest(BaseModel):
     instagram_publish: bool = False
     facebook_publish: bool = False
     linkedin_publish: bool = False
+    tiktok_publish: bool = False
 
 
 @router.post("/publish")
@@ -83,6 +84,12 @@ def publish_post(data: PublishPostRequest):
                     f"{drive_prepare_error}"
                 )
 
+            if platform == "tiktok" and data.tiktok_publish:
+                raise ValueError(
+                    "Remote TikTok publishing is not implemented. "
+                    "Set tiktok_publish=false to run local validation only."
+                )
+
             result = service.publish(
                 platform=platform,
                 video_path=data.video_path,
@@ -93,9 +100,16 @@ def publish_post(data: PublishPostRequest):
                 facebook_publish=data.facebook_publish,
                 linkedin_publish=data.linkedin_publish,
                 media_asset=media_asset,
+                tiktok_publish=data.tiktok_publish,
             )
 
             is_dry_run = bool(result.get("dry_run"))
+            is_published = result.get("published")
+            if is_published is None:
+                is_published = not is_dry_run
+            else:
+                is_published = bool(is_published)
+
             result_status = result.get("status") or (
                 "ready" if is_dry_run else "published"
             )
@@ -110,12 +124,16 @@ def publish_post(data: PublishPostRequest):
 
             results[platform] = {
                 "success": True,
-                "published": not is_dry_run,
+                "published": is_published,
                 "dry_run": is_dry_run,
                 "status": result_status,
                 "remote_post_id": result.get("video_id"),
                 "url": result.get("url"),
             }
+
+            if platform == "tiktok":
+                results[platform]["message"] = result.get("message")
+                results[platform]["validation"] = result.get("validation")
 
         except Exception as exc:
             create_publish_result(
