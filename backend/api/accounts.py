@@ -16,6 +16,7 @@ from database.db import (
     get_connected_account,
     upsert_connected_account,
 )
+from integrations.tiktok import TikTokPublisher, TikTokUploadError
 from services.tiktok_credentials import SecureStorageError
 from services.tiktok_oauth import (
     TIKTOK_REQUIRED_REDIRECT_URI,
@@ -1066,6 +1067,57 @@ def tiktok_status():
         }
     )
     return response
+
+
+@router.get("/tiktok/creator-info")
+def tiktok_creator_info():
+    settings = _tiktok_settings()
+
+    try:
+        creator_info = TikTokPublisher(
+            environment=settings["environment"],
+            expected_sandbox_username=os.getenv(
+                "TIKTOK_SANDBOX_ACCOUNT_USERNAME",
+                "",
+            ),
+        ).fetch_creator_info()
+    except TikTokUploadError as exc:
+        if exc.error_code == "rate_limit_exceeded":
+            status_code = 429
+        elif exc.error_code in {
+            "access_token_invalid",
+            "authorization_unavailable",
+            "not_connected",
+            "refresh_token_expired",
+            "invalid_stored_credentials",
+        }:
+            status_code = 401
+        elif exc.error_code in {
+            "scope_not_authorized",
+            "missing_required_scopes",
+        }:
+            status_code = 403
+        elif exc.error_code == "secure_storage_unavailable":
+            status_code = 503
+        elif exc.error_code in {
+            "spam_risk_too_many_posts",
+            "spam_risk_user_banned_from_posting",
+            "reached_active_user_cap",
+        }:
+            status_code = 409
+        else:
+            status_code = 502
+
+        raise HTTPException(
+            status_code=status_code,
+            detail=str(exc),
+        ) from exc
+
+    return {
+        "platform": "tiktok",
+        "environment": settings["environment"],
+        **creator_info,
+    }
 
 
 @router.delete("/tiktok")

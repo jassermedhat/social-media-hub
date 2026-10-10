@@ -6,12 +6,21 @@ from api.posts import router as posts_router
 from api.youtube import router as youtube_router
 from database.db import init_db
 from fastapi import FastAPI
+from services.tiktok_reconciliation import (
+    create_status_tracker_from_environment,
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    yield
+    tracker = create_status_tracker_from_environment()
+    app.state.tiktok_status_tracker = tracker
+    app.state.tiktok_status_tracking_started = await tracker.start()
+    try:
+        yield
+    finally:
+        await tracker.stop()
 
 
 app = FastAPI(

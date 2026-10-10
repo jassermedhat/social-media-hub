@@ -21,6 +21,7 @@ from integrations.tiktok import (
     TIKTOK_MAX_CAPTION_UTF16_UNITS,
     TIKTOK_MAX_VIDEO_SIZE_BYTES,
     TikTokPublisher,
+    TikTokUploadError,
     count_utf16_units,
 )
 
@@ -136,13 +137,17 @@ class TikTokPublisherValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "2,200 UTF-16"):
                 self.publish(video, emoji_boundary + "\U0001f600")
 
-    def test_remote_publish_flag_is_rejected_before_file_access(self):
-        with self.assertRaisesRegex(ValueError, "not implemented"):
-            TikTokPublisher().publish(
-                video_path="does-not-need-to-exist.mp4",
-                title="Test",
-                publish=True,
-            )
+    def test_remote_publish_requires_explicit_manual_upload_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            video = Path(directory) / "sample.mp4"
+            video.write_bytes(b"not-empty")
+
+            with self.assertRaisesRegex(TikTokUploadError, "manual_upload"):
+                TikTokPublisher().publish(
+                    video_path=str(video),
+                    title="Test",
+                    publish=True,
+                )
 
     def test_local_validation_makes_no_http_request(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -167,12 +172,18 @@ class TikTokPublishingWorkflowTests(unittest.TestCase):
         payload.update(overrides)
         return posts.PublishPostRequest(**payload)
 
-    def test_tiktok_publish_true_is_rejected_and_isolated(self):
+    def test_tiktok_direct_post_rejection_is_isolated(self):
         service = Mock()
-        service.publish.return_value = {
-            "video_id": "youtube-id",
-            "url": "https://example.invalid/video",
-        }
+
+        def publish(**kwargs):
+            if kwargs["platform"] == "tiktok":
+                raise ValueError("TikTok Direct Post is not implemented.")
+            return {
+                "video_id": "youtube-id",
+                "url": "https://example.invalid/video",
+            }
+
+        service.publish.side_effect = publish
 
         with (
             patch.object(posts, "create_post", return_value=41),
@@ -185,18 +196,18 @@ class TikTokPublishingWorkflowTests(unittest.TestCase):
                     "unused.mp4",
                     platforms=["tiktok", "youtube"],
                     tiktok_publish=True,
+                    tiktok_mode="direct_post",
                 )
             )
 
         self.assertFalse(response["results"]["tiktok"]["success"])
         self.assertIn(
-            "Remote TikTok publishing is not implemented",
+            "TikTok Direct Post is not implemented",
             response["results"]["tiktok"]["error"],
         )
         self.assertTrue(response["results"]["youtube"]["success"])
         self.assertTrue(response["results"]["youtube"]["published"])
-        self.assertEqual(service.publish.call_count, 1)
-        self.assertEqual(service.publish.call_args.kwargs["platform"], "youtube")
+        self.assertEqual(service.publish.call_count, 2)
         self.assertEqual(record.call_count, 2)
         drive.assert_not_called()
 
@@ -240,7 +251,6 @@ class TikTokPublishingWorkflowTests(unittest.TestCase):
             return {
                 "published": False,
                 "dry_run": False,
-                "status": "processing",
             }
 
         service.publish.side_effect = publish
@@ -257,7 +267,7 @@ class TikTokPublishingWorkflowTests(unittest.TestCase):
         self.assertTrue(response["results"]["youtube"]["published"])
         self.assertEqual(response["results"]["youtube"]["status"], "published")
         self.assertFalse(response["results"]["linkedin"]["published"])
-        self.assertEqual(response["results"]["linkedin"]["status"], "processing")
+        self.assertEqual(response["results"]["linkedin"]["status"], "ready")
 
     def test_ready_result_is_stored_and_visible_in_history(self):
         with tempfile.TemporaryDirectory() as directory:

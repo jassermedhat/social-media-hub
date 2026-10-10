@@ -18,3 +18,4 @@ backend/tiktok_credentials.bin
 backend/tiktok_oauth_state.bin
 backend/.tiktok_credentials.bin.*.tmp
 backend/.tiktok_oauth_state.bin.*.tmp
+backend/.tiktok_status_tracker.lock

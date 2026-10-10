@@ -18,6 +18,16 @@ class PublishingService:
         linkedin_publish: bool = False,
         media_asset: MediaAsset | None = None,
         tiktok_publish: bool = False,
+        tiktok_mode: str = "validation",
+        tiktok_user_consent: bool = False,
+        tiktok_privacy_level: str | None = None,
+        tiktok_allow_comment: bool = False,
+        tiktok_allow_duet: bool = False,
+        tiktok_allow_stitch: bool = False,
+        tiktok_commercial_content_disclosure: bool = False,
+        tiktok_brand_content_toggle: bool = False,
+        tiktok_brand_organic_toggle: bool = False,
+        tiktok_is_aigc: bool = False,
     ):
         platform = platform.lower()
 
@@ -75,6 +85,18 @@ class PublishingService:
                 description=description,
                 privacy=privacy,
                 publish=tiktok_publish,
+                mode=tiktok_mode,
+                user_consent=tiktok_user_consent,
+                privacy_level=tiktok_privacy_level,
+                allow_comment=tiktok_allow_comment,
+                allow_duet=tiktok_allow_duet,
+                allow_stitch=tiktok_allow_stitch,
+                commercial_content_disclosure=(
+                    tiktok_commercial_content_disclosure
+                ),
+                brand_content_toggle=tiktok_brand_content_toggle,
+                brand_organic_toggle=tiktok_brand_organic_toggle,
+                is_aigc=tiktok_is_aigc,
             )
 
         raise ValueError(
