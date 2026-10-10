@@ -117,6 +117,19 @@ def get_connected_account(platform: str):
     return dict(row)
 
 
+def delete_connected_account(platform: str):
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            DELETE FROM connected_accounts
+            WHERE platform = ?
+            """,
+            (platform,),
+        )
+
+        return cursor.rowcount
+
+
 def create_post(
     video_path: str,
     title: str,

@@ -7,13 +7,24 @@ from urllib.parse import urlencode
 import requests
 from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
 from database.db import (
+    delete_connected_account,
     get_connected_account,
     upsert_connected_account,
+)
+from services.tiktok_credentials import SecureStorageError
+from services.tiktok_oauth import (
+    TIKTOK_REQUIRED_REDIRECT_URI,
+    TIKTOK_REQUIRED_SCOPES,
+    TikTokOAuthError,
+    TikTokReauthorizationRequired,
+    TikTokStateError,
+    create_tiktok_service,
+    parse_scopes,
 )
 
 router = APIRouter(
@@ -745,6 +756,415 @@ def meta_status():
             else {
                 "connected": False,
             }
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# TikTok Desktop Login Kit
+# ---------------------------------------------------------------------------
+
+
+def _environment_boolean(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+
+    if value is None:
+        return default
+
+    normalized = value.strip().lower()
+
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(f"{name} must be true or false.")
+
+
+def _tiktok_settings(*, require_configured: bool = True):
+    configured_scopes = parse_scopes(
+        os.getenv(
+            "TIKTOK_SCOPES",
+            "user.info.basic,video.publish,video.upload",
+        )
+    )
+    redirect_uri = os.getenv(
+        "TIKTOK_REDIRECT_URI",
+        TIKTOK_REQUIRED_REDIRECT_URI,
+    ).strip()
+    environment = os.getenv(
+        "TIKTOK_ENVIRONMENT",
+        "sandbox",
+    ).strip().lower()
+
+    boolean_configuration_issue = None
+
+    try:
+        direct_post_enabled = _environment_boolean(
+            "TIKTOK_DIRECT_POST_ENABLED",
+            False,
+        )
+        public_posting_enabled = _environment_boolean(
+            "TIKTOK_PUBLIC_POSTING_ENABLED",
+            False,
+        )
+    except ValueError as exc:
+        if require_configured:
+            raise HTTPException(
+                status_code=500,
+                detail=str(exc),
+            ) from exc
+
+        direct_post_enabled = False
+        public_posting_enabled = False
+        boolean_configuration_issue = str(exc).split()[0]
+
+    settings = {
+        "client_key": os.getenv("TIKTOK_CLIENT_KEY", "").strip(),
+        "client_secret": os.getenv(
+            "TIKTOK_CLIENT_SECRET",
+            "",
+        ).strip(),
+        "redirect_uri": redirect_uri,
+        "scopes": sorted(configured_scopes),
+        "environment": environment,
+        "direct_post_enabled": direct_post_enabled,
+        "public_posting_enabled": public_posting_enabled,
+    }
+
+    issues = []
+
+    if boolean_configuration_issue:
+        issues.append(boolean_configuration_issue)
+
+    if not settings["client_key"]:
+        issues.append("TIKTOK_CLIENT_KEY")
+
+    if not settings["client_secret"]:
+        issues.append("TIKTOK_CLIENT_SECRET")
+
+    if redirect_uri != TIKTOK_REQUIRED_REDIRECT_URI:
+        issues.append("TIKTOK_REDIRECT_URI")
+
+    missing_scopes = TIKTOK_REQUIRED_SCOPES - configured_scopes
+
+    if missing_scopes:
+        issues.append("TIKTOK_SCOPES")
+
+    if environment != "sandbox":
+        issues.append("TIKTOK_ENVIRONMENT")
+
+    if public_posting_enabled:
+        issues.append("TIKTOK_PUBLIC_POSTING_ENABLED")
+
+    settings["configured"] = not issues
+    settings["configuration_issues"] = issues
+
+    if require_configured and issues:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": (
+                    "TikTok Sandbox OAuth is not configured safely."
+                ),
+                "configuration": issues,
+            },
+        )
+
+    return settings
+
+
+def _tiktok_service(settings=None):
+    return create_tiktok_service(
+        settings or _tiktok_settings(),
+        BASE_DIR,
+    )
+
+
+def _tiktok_http_status(exc: TikTokOAuthError) -> int:
+    if exc.reauthorization_required:
+        return 401
+
+    return 502
+
+
+@router.get("/tiktok/connect")
+def connect_tiktok():
+    settings = _tiktok_settings()
+
+    try:
+        authorization_url = _tiktok_service(
+            settings
+        ).authorization_url()
+    except SecureStorageError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "TikTok secure storage is unavailable. "
+                "Authorization was not started."
+            ),
+        ) from exc
+
+    return RedirectResponse(authorization_url)
+
+
+@router.get("/tiktok/callback")
+def tiktok_callback(request: Request):
+    settings = _tiktok_settings()
+    service = _tiktok_service(settings)
+
+    try:
+        account = service.complete_authorization(
+            state=request.query_params.get("state"),
+            code=request.query_params.get("code"),
+            oauth_error=request.query_params.get("error"),
+        )
+    except SecureStorageError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "TikTok secure storage is unavailable. "
+                "No credentials were saved."
+            ),
+        ) from exc
+    except TikTokStateError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=exc.safe_detail(),
+        ) from exc
+    except TikTokOAuthError as exc:
+        raise HTTPException(
+            status_code=(
+                400
+                if exc.reauthorization_required
+                or exc.error_code in {
+                    "access_denied",
+                    "missing_authorization_code",
+                    "missing_required_scopes",
+                }
+                else _tiktok_http_status(exc)
+            ),
+            detail=exc.safe_detail(),
+        ) from exc
+
+    delete_connected_account("tiktok")
+    upsert_connected_account(
+        platform="tiktok",
+        account_id=account["account_id"],
+        account_name=account["account_name"],
+        token_file="tiktok_credentials.bin",
+    )
+
+    return {
+        "success": True,
+        "platform": "tiktok",
+        "configured": True,
+        "connected": True,
+        "environment": settings["environment"],
+        "account_id": account["account_id"],
+        "account_name": account["account_name"],
+        "granted_scopes": account["granted_scopes"],
+        "authorization_status": "connected",
+        "direct_post_enabled": settings["direct_post_enabled"],
+        "public_posting_enabled": False,
+        "message": "TikTok connected successfully.",
+    }
+
+
+@router.get("/tiktok/status")
+def tiktok_status():
+    settings = _tiktok_settings(require_configured=False)
+    account = get_connected_account("tiktok")
+    response = {
+        "platform": "tiktok",
+        "configured": settings["configured"],
+        "connected": False,
+        "environment": settings["environment"],
+        "authorization_status": "not_connected",
+        "reauthorization_required": False,
+        "direct_post_enabled": settings["direct_post_enabled"],
+        "public_posting_enabled": False,
+    }
+
+    if settings["configuration_issues"]:
+        response["configuration_issues"] = settings[
+            "configuration_issues"
+        ]
+
+    if account:
+        response.update(
+            {
+                "account_id": account["account_id"],
+                "account_name": account["account_name"],
+                "connected_at": account["connected_at"],
+            }
+        )
+
+    if not settings["configured"]:
+        response["authorization_status"] = "configuration_required"
+        return response
+
+    service = _tiktok_service(settings)
+
+    try:
+        credentials = service.valid_credentials()
+    except SecureStorageError:
+        response["authorization_status"] = "secure_storage_unavailable"
+        return response
+    except TikTokReauthorizationRequired as exc:
+        delete_connected_account("tiktok")
+        response.update(
+            {
+                "authorization_status": "reauthorization_required",
+                "reauthorization_required": True,
+                "error": exc.error_code,
+            }
+        )
+        return response
+    except TikTokOAuthError as exc:
+        response.update(
+            {
+                "authorization_status": "refresh_failed",
+                "reauthorization_required": (
+                    exc.reauthorization_required
+                ),
+                "error": exc.error_code,
+            }
+        )
+        return response
+
+    safe_account = service.safe_account(credentials)
+
+    if (
+        not account
+        or account["account_id"] != safe_account["account_id"]
+    ):
+        delete_connected_account("tiktok")
+        upsert_connected_account(
+            platform="tiktok",
+            account_id=safe_account["account_id"],
+            account_name=safe_account["account_name"],
+            token_file="tiktok_credentials.bin",
+        )
+        account = get_connected_account("tiktok")
+
+    response.update(
+        {
+            "connected": True,
+            "authorization_status": "connected",
+            "account_id": safe_account["account_id"],
+            "account_name": safe_account["account_name"],
+            "granted_scopes": safe_account["granted_scopes"],
+            "access_expires_at": safe_account["access_expires_at"],
+            "refresh_expires_at": safe_account["refresh_expires_at"],
+            "connected_at": (
+                account["connected_at"]
+                if account
+                else None
+            ),
+        }
+    )
+    return response
+
+
+@router.delete("/tiktok")
+def disconnect_tiktok(force_local: bool = False):
+    settings = _tiktok_settings(require_configured=False)
+    service = _tiktok_service(settings)
+    account = get_connected_account("tiktok")
+
+    if not service.credential_store.exists():
+        try:
+            service.clear_local()
+        except SecureStorageError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="TikTok local credentials could not be removed.",
+            ) from exc
+
+        delete_connected_account("tiktok")
+        return {
+            "success": True,
+            "platform": "tiktok",
+            "disconnected": True,
+            "remote_revoked": False,
+            "local_credentials_removed": True,
+            "message": "TikTok was already disconnected locally.",
+        }
+
+    revocation_error = None
+
+    if not settings["configured"]:
+        revocation_error = TikTokOAuthError(
+            "TikTok revocation requires valid local configuration.",
+            error_code="configuration_required",
+        )
+    else:
+        try:
+            service.revoke()
+        except SecureStorageError as exc:
+            revocation_error = TikTokOAuthError(
+                "TikTok secure storage is unavailable.",
+                error_code="secure_storage_unavailable",
+            )
+            revocation_error.__cause__ = exc
+        except TikTokOAuthError as exc:
+            revocation_error = exc
+
+    if revocation_error is not None and not force_local:
+        content = {
+            "success": False,
+            "platform": "tiktok",
+            "disconnected": False,
+            "remote_revoked": False,
+            "local_credentials_removed": False,
+            "error": revocation_error.safe_detail(),
+            "message": (
+                "TikTok revocation could not be confirmed. "
+                "Local credentials were retained. Retry, or deliberately "
+                "request force_local=true to remove only local access."
+            ),
+        }
+
+        if account:
+            content["account_id"] = account["account_id"]
+
+        return JSONResponse(status_code=502, content=content)
+
+    try:
+        service.clear_local()
+    except SecureStorageError as exc:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "platform": "tiktok",
+                "disconnected": False,
+                "remote_revoked": revocation_error is None,
+                "local_credentials_removed": False,
+                "message": "TikTok local credentials could not be removed.",
+            },
+        )
+
+    delete_connected_account("tiktok")
+
+    return {
+        "success": True,
+        "platform": "tiktok",
+        "disconnected": True,
+        "remote_revoked": revocation_error is None,
+        "local_credentials_removed": True,
+        "warning": (
+            revocation_error.safe_detail()
+            if revocation_error is not None
+            else None
+        ),
+        "message": (
+            "TikTok credentials were removed locally, but remote "
+            "revocation could not be confirmed."
+            if revocation_error is not None
+            else "TikTok disconnected and authorization was revoked."
         ),
     }
 
